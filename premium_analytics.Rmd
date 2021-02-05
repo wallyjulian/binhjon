@@ -20,7 +20,7 @@ source("./R/premium_analysis.R")
 
 data_suffix <- "data012"
 date_data <- 
-  get_test_intervals("2021-01-30") # 2021-01-16 2021-01-30
+  get_test_intervals("2021-01-30") 
 
 pre_period_start <- date_data$all_dates[1]
 post_period_end <- date_data$all_dates[4]
@@ -547,7 +547,7 @@ nm_results_tbl %>%
   kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
   kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
 ```
-Finally, compute seasonality seasonality 
+Finally, compute seasonality
 ```{r}
 result_07 <- 
   result_06 %>% 
@@ -580,7 +580,7 @@ seasonality_nm_results_tbl %>%
   kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
   kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
 ```
-We have a similar table to volumes
+We have a similar table for volumes
 ```{r}
 # generate the table for the base case
 base_vol_results_tbl <- 
