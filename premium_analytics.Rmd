@@ -1,0 +1,698 @@
+---
+title: "premium_analytics"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{premium_analytics}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE, echo=F}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, echo=F}
+library(magrittr)
+source("./R/premium_analysis.R")
+
+data_suffix <- "data012"
+date_data <- 
+  get_test_intervals("2021-01-30") # 2021-01-16 2021-01-30
+
+pre_period_start <- date_data$all_dates[1]
+post_period_end <- date_data$all_dates[4]
+
+pre_period_end <- date_data$all_dates[2]
+post_period_start <- date_data$all_dates[3]
+
+```
+The purpose of this vignette is to illustrate the steps implementing the premium grade analytics for the Premium Grades Project ( aka the Qwikwinz Project).
+
+To start, data is extracted for the desired periods from the NAV database, using the Power BI document created by Jeremy Reichart. Data is extracted in two csv files, one each for the pre- and post-periods. In the analysis following, the pre-period is from `r pre_period_start` to `r pre_period_end` and the post period starts on `r post_period_start` and ends on `r post_period_end`.
+
+***(1) LOAD DATA***
+
+The first step is to load the pre- and post-period data as follows:
+
+```{r}
+# * read prior data ----
+
+# set file names, one for the pre-period and one for the post-period
+prior_name <- 
+  paste0("./Data/prior_", data_suffix, ".csv")
+post_name <- 
+  paste0("./Data/post_", data_suffix, ".csv")
+
+# combine the two periods into one table, 
+# and add a *period* column to indicate the corresponding period  
+dat <-
+  dplyr::bind_rows(
+    read.csv(prior_name) %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(period="prior", .before="Site.ID")
+    , read.csv(post_name) %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(period="post", .before="Site.ID")
+  ) %>%
+  dplyr::mutate(Site.ID=as.character(Site.ID))
+
+# show a sample of the data
+dat %>% dplyr::slice_head(n=5)
+```
+***(2) ADD TACTIC CHANGE INFORMATION***
+
+Next we join the raw data with a table containing information on the tactic changes used in the pilot. The tactic change table is called *tactic_changes* and is part of this package. We then pivot the result around the fuel grades (in the *product* column). The resulting table will have (3 fuel grades) X (2 periods) X (4 features) = 24 data columns.
+```{r add_tactic_change}
+# join with the list of test sites and tactic changes
+load("./Data/tactic_changes.rda")
+
+data_tbl <-
+  # join by Site.ID 
+  dplyr::left_join(
+    tactic_changes
+    ,dat
+    , by=c("Site Id"="Site.ID")
+    ) %>%
+  # pivot the values around the period and the product
+  tidyr::pivot_wider(
+    names_from=c(period,Product)
+    , values_from=c(TY.Vol,TY.FM.,FM.cpl,NM.cpl)
+    )
+# show a sample of the result
+data_tbl %>% dplyr::slice_head(n=5) %>% dplyr::glimpse()
+```
+Finally, we nest this data prior to processing. The nesting compresses everything but the site number into a single column.
+```{r}
+data_tbl %<>%
+  stats::na.omit() %>%
+  dplyr::rename(site = `Site Id`) %>%
+  # pack everything but the *site* column into a new column called *data*
+  tidyr::nest(data=-site)
+# show a bit of the result
+data_tbl %>% dplyr::slice_head(n=5)
+```
+
+
+With the data prepared, we apply functions to the data contained in the data column for each site (i.e. row). These function manipulate the data in the table so we have it in a form facilitating the analysis.
+
+***(3) ORGANIZE***
+
+The first function applied is *BI.get.test.tbl*, which separates the pre- and post-period data, renames some of the columns and then calls the function *pre.post.summarize* to summarize the data. *BI.get.test.tbl* is defined as follows:
+```{r BI.get.test.tbl}
+BI.get.test.tbl <-
+  function(dat){
+    # select the columns containing the raw data
+    foo <-
+      dat %>%
+      dplyr::select(
+        c(starts_with("TY."), starts_with("NMD.")
+          , starts_with("NM."), starts_with("FM.")) )
+    
+    # bind together separate tables for the prior- and post- periods
+    dplyr::bind_rows(
+      foo %>%
+        # select the prior data, without the FM column
+        dplyr::select( c(contains("prior"),-contains("FM")) ) %>%
+        # rename to removed the period from the column name
+        dplyr::rename_with(.fn = ~stringr::str_replace(., "prior_", "")) %>%
+        # name this row
+        dplyr::mutate(calculation="pre sum", .before = TY.Vol_MID)
+      
+      , foo %>%
+        # select the post data, without the FM column
+        dplyr::select( c(contains("post"),-contains("FM")) ) %>%
+        # rename to removed the period from the column name
+        dplyr::rename_with(.fn = ~stringr::str_replace(., "post_", "")) %>%
+        # name this row
+        dplyr::mutate(calculation="post sum", .before = TY.Vol_MID)
+    ) %>%
+      # summarize, adding totals and percentages
+      pre.post.summarize() %>%
+      # add columns with information on the tactic change
+      dplyr::mutate(change = dat$Change
+             , grade_diffs = dat$`Grade Capping Type` ) %>%
+      return()
+  }
+```
+The function that does the work of summarizing the data is called *pre.post.summarize*;  it takes the differences (post - pre), computes percentages and adds these to the data.  The function *pre.post.summarize* is defined as follows:
+```{r pre.post.summarize}
+pre.post.summarize <-
+  function(dat){
+    # compute where to put results
+    .before_offset <- dim(dat)[2]-1
+    # 
+    dplyr::bind_rows(
+      dat
+      , dat %>%
+        # take differences
+        dplyr::summarize(dplyr::across(where(is.numeric), diff)) %>%
+        # name this row
+        dplyr::mutate(
+          calculation="post-pre"
+          , .before = tidyselect::last_col(.before_offset))
+      , dat %>%
+        # calculate percentages
+        dplyr::summarize(
+          dplyr::across(
+            where(is.numeric)
+            , ~(exp(diff(log(.)))-1) )
+          ) %>%
+        # name this row
+        dplyr::mutate(
+          calculation="(post/pre)-1"
+          , .before = tidyselect::last_col(.before_offset))
+    )
+  }
+```
+So in the in this first step we get
+```{r}
+# modify *data_tbl* save the modified version as *result_01*
+result_01 <- 
+  data_tbl %>%
+  dplyr::mutate( 
+    # apply the function * BI.get.test.tbl* to each row in the *date* column
+    # and place the results in a column names *results*.
+    results = purrr::map(data, BI.get.test.tbl) 
+    )
+# show a bit of the resulting table
+result_01 %>% dplyr::slice_head(n=5)
+```
+And taking a peek at the contents of the results column:
+```{r}
+result_01 %>% 
+  # pull out the row for site 1703
+  dplyr::slice(1) %>% 
+  dplyr::pull(results) %>% 
+  purrr::pluck(1) %>% 
+  dplyr::glimpse()
+```
+Now that we have the basic information, we construct the net margin summary.
+
+***(4) SUMMARIZE***
+
+The function that does this is called *net.margin.summary*, (basically much manipulation) defined as follows:
+```{r net.margin.summary}
+net.margin.summary <-
+  function(dat){
+    # create the net margin table (just one row)
+    NM_tbl <-
+      dat %>%
+      # separate the grade diff strings into midgrade and premium diffs
+      tidyr::separate(grade_diffs, into=c("t_MUL","t_PUL"), ",", remove=F) %>%
+      # clean up 
+      dplyr::mutate(t_PUL = stringr::str_trim(t_PUL)
+             , `diff_nm:MID` = as.numeric(stringr::str_sub(t_MUL, -2))
+             , `diff_nm:PUL` = as.numeric(stringr::str_sub(t_PUL, -2)) ) %>%
+      # separate the tactic diff strings into midgrade and premium tactic changes
+      tidyr::separate(change, into=c("c_MUL","c_PUL"), ",", remove=F) %>%
+      # clean up
+      dplyr::mutate(c_PUL = stringr::str_trim(c_PUL)
+             , `tactic_nm:MID` = as.numeric(stringr::str_sub(c_MUL, -2))
+             , `tactic_nm:PUL` = as.numeric(stringr::str_sub(c_PUL, -2)) ) %>%
+      # set the changes for regular grades to zero
+      dplyr::mutate(`diff_nm:RUL` = 0, `tactic_nm:RUL` = 0) %>%
+      # clean up the column names
+      dplyr::rename_with(
+        .cols=starts_with("NM.cpl_")
+        , ~stringr::str_replace(., "NM.cpl_", "actual_nm:")) %>%
+      # pull out the post-period row, and the columns containing the net margins
+      dplyr::filter(calculation=="post sum") %>%  
+      dplyr::select(contains("_nm")) 
+    
+    # create the volume table (just one row)
+    VOL_tbl <-
+      dat %>%
+      # pull out the 'pre sum' row
+      dplyr::filter(calculation=="pre sum") %>%
+      # select the columns containing the volumes
+      dplyr::select(starts_with("TY.Vol_")) %>%
+      # rename the columns
+      dplyr::rename_with(~stringr::str_replace(.,"TY.Vol_","pre volume:")) %>%
+      # bind
+      dplyr::bind_cols(
+        dat %>%
+          # select the percent change row
+          dplyr::filter(calculation=="(post/pre)-1") %>%
+          # select the volume columns
+          dplyr::select(starts_with("TY.Vol_")) %>%
+          # rename the columns
+          dplyr::rename_with(~stringr::str_replace(.,"TY.Vol_","imputed_pct:")) %>%
+          # net out the percent change due to regular grade
+          dplyr::mutate(dplyr::across(tidyselect::everything(),~.-`imputed_pct:RUL`))
+      )
+    
+  # now put everything together
+    dplyr::bind_cols(
+      # put the volume and net margin table together (still just one row)
+      VOL_tbl
+      , NM_tbl) %>%
+      # now calculate the items of interest
+      dplyr::mutate(
+        `imputed post volume:MID`=`pre volume:MID` * (1+`imputed_pct:MID`)
+        , `imputed post volume:PUL`=`pre volume:PUL` * (1+`imputed_pct:PUL`)
+        , `imputed post volume:RUL`=`pre volume:RUL` * (1+`imputed_pct:RUL`)
+        , `imputed nm price:MID`=`imputed post volume:MID` * `tactic_nm:MID`/100
+        , `imputed nm price:PUL`=`imputed post volume:PUL` * `tactic_nm:PUL`/100
+        , `imputed nm price:RUL`=`imputed post volume:RUL` * `tactic_nm:RUL`/100
+        , `imputed nm volume:MID`=`pre volume:MID` * `imputed_pct:MID` * `actual_nm:MID`/100
+        , `imputed nm volume:PUL`=`pre volume:PUL` * `imputed_pct:PUL` * `actual_nm:PUL`/100
+        , `imputed nm volume:RUL`=`pre volume:RUL` * `imputed_pct:RUL` * `actual_nm:RUL`/100
+        , `imputed nm total:MID` = `imputed nm price:MID` + `imputed nm volume:MID`
+        , `imputed nm total:PUL` = `imputed nm price:PUL` + `imputed nm volume:PUL`
+        , `imputed nm total:RUL` = `imputed nm price:RUL` + `imputed nm volume:RUL`
+      ) %>%
+      # pivot the wide row into a table
+      tidyr::pivot_longer(everything()) %>%
+      # create columns: measurement and grade 
+      tidyr::separate(name, into=c("name","grade"), ":", remove=T) %>%
+      # pivot back to a wide table by grade
+      tidyr::pivot_wider(names_from = grade) %>%
+      return()
+  }
+```
+
+So we apply this function to the information in the *results* column as follows:
+```{r}
+# modify the *result_01* table and save it in *result_02*
+result_02 <-
+  result_01 %>%
+  dplyr::mutate( 
+    # modify the information in the *results* columns and
+    # store the summary table in a new column called *nm_summary*.
+    summary = purrr::map(results, net.margin.summary )
+    )
+# show a bit of the *result_02* table
+result_02 %>% dplyr::slice_head(n=5)
+```
+And taking a peek at the column *summary* for the first row:
+```{r}
+result_02 %>% 
+  # pull out the row for site 1703
+  dplyr::slice(1) %>% 
+  dplyr::pull(summary) %>% 
+  purrr::pluck(1) %>% 
+  kableExtra::kbl(
+    format.args = list(digits=2, scientific=F)
+    , caption = "Baseline margin summary") %>% 
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped")
+    , font_size = 12, full_width = F
+    )
+```
+
+***(4) TWEAK SEASONALITY***
+
+We have a set of tweaks to the period-over-period percent changes that account for seasonality.
+
+To incorporate the tweaks we load the markets table and the adjustments table and join them: 
+```{r seasonality_tweak}
+load("./Data/site_markets.rda")
+
+seasonality_adjustments <-
+  site_markets %>% 
+  dplyr::left_join(
+    # load adjustments table from disk
+    read.csv(
+    "./Data/seasonality_adjustments.csv"
+    , stringsAsFactors = F
+    )
+    # join market and seasonality adjustments by market
+    , by = "market"
+  )
+
+seasonality_adjustments %>% 
+  dplyr::slice_head(n=5)
+
+```
+We then join this table to our results by site, pulling the tactic change data from the results into a new column, and finally nesting into two new columns, updating our prior result from *result_02* to *result_03* and renaming the results and summary columns.
+```{r}
+result_03 <- 
+  result_02 %>% 
+  # join seasonality and market data to the result_02 table
+  dplyr::left_join(
+    seasonality_adjustments
+    , by = c("site"="Site.Id")
+    , keep = TRUE
+  ) %>% 
+  # pull out the change data from the results table
+  dplyr::mutate(
+    change = 
+      purrr::map(
+        results
+        , .f = function(x){
+          # print(x)
+          x %>% 
+            dplyr::filter(calculation=="pre sum") %>% 
+            dplyr::pull(change)
+        }
+      )
+  ) %>% 
+  tidyr::unnest(cols=change) %>% 
+  # nest seasonality and market data, first adding the change column to the market data
+  tidyr::nest(mkt_data = c(Site.Id, Site, prov, market, change)) %>% 
+  tidyr::nest(seasonality_tweaks = c(MID_adj, PUL_adj)) %>% 
+  # clean up by renaming the results and nm_summary columns
+  dplyr::rename(base_results = results, base_summary = summary)
+
+# show the two new columns
+result_03 %>% 
+  dplyr::slice_head(n=5)
+
+```
+Now we apply the tweaks to the original results table (now named "based_results") using the following function
+
+```{r map_tweak}
+map_tweak <- 
+  function(tbl, tweaks){
+    tmp_names <- names(tbl)
+    # define function for the seasonality tweaks
+    update_cols <-
+      function(vals, s_tweak){
+        .a <- vals[1]
+        .d <- vals[4]-s_tweak
+        .b <- .a * (1 + .d)
+        .c <- .b - .a
+        return(c(.a, .b, .c, .d))
+      }
+    MID_vals <- tbl %>% dplyr::pull(TY.Vol_MID)
+    PUL_vals <- tbl %>% dplyr::pull(TY.Vol_PUL)
+    
+    tbl %>% 
+      dplyr::select(-c(TY.Vol_MID,TY.Vol_PUL)) %>% 
+      tibble::add_column(
+        TY.Vol_PUL = update_cols(PUL_vals, tweaks %>% dplyr::pull(PUL_adj))
+        , TY.Vol_MID = update_cols(MID_vals, tweaks %>% dplyr::pull(MID_adj))
+      ) %>% 
+      dplyr::select(all_of(tmp_names)) %>% 
+    return()
+}
+
+```
+
+
+with the results of the tweaks stored in the column *seasonality_results* and a corresponding summary column named *seasonality_summary*.
+```{r}
+result_04 <- 
+  result_03 %>% 
+  dplyr::mutate(
+    seasonality_results =
+      purrr::map2(
+        base_results
+        , seasonality_tweaks
+        , ~map_tweak(.x, .y)
+      )
+    , seasonality_summary = purrr::map(seasonality_results, net.margin.summary )
+  )
+```
+
+looking at seasonality_summary for the first row
+```{r}
+result_04 %>% 
+  # pull out the row for site 1703
+  dplyr::slice(1) %>% 
+  dplyr::pull( seasonality_summary) %>% 
+  purrr::pluck(1) %>% 
+  kableExtra::kbl(
+    format.args = list(digits=2, scientific=F)
+    , caption = "Net margin summary with season tweaks") %>% 
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped")
+    , font_size = 12, full_width = F
+    )
+
+```
+There are more tweaks to come, but we pause here to process the results ahead of exhibiting the results.
+
+The final processing step is performed by the function *get_NMD_by_market_table* which manipulates the data into a form suitable for presentation. The function *get_NMD_by_market_table* takes as input a table with two columns, one with a name containing "data" and the other with a name containing "nm_summary." The _data_ column contains the site information while the _nm_summary_ column contains nm summary information.
+
+The function *get_NMD_by_market_table* returns a table with all the information necessary for presentation. All that remains is to filter the table for the market of interest.
+
+Let's run the function and look at the base results for Alberta:
+```{r}
+load("./Data/premium_diff_target_dat.rda")
+
+# generate the table for the base case
+base_results_tbl <- 
+  result_04 %>% 
+  dplyr::select(mkt_data,base_summary) %>%
+  get_NMD_by_market_table(days=as.numeric(date_data$last_interval))
+
+# filter out the results for Alberta and present them
+base_results_tbl %>% 
+  dplyr::filter(prov=="AB") %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-prov) %>% 
+  dplyr::mutate(dplyr::across(where(is.numeric),scales::dollar)) %>% 
+  kableExtra::kbl(align = "rlrrr", digits = 2, caption = "Alberta Markets (baseline)" ) %>% 
+  kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
+```
+Let's do the same for the the Alberta markets, but using the seasonality adjustment
+```{r}
+# generate the table for the base case
+seasonality_results_tbl <- 
+  result_04 %>% 
+  dplyr::select(mkt_data,seasonality_summary) %>% 
+  get_NMD_by_market_table(days=as.numeric(date_data$last_interval))
+
+# filter out the results for Alberta and present them
+seasonality_results_tbl %>% 
+  dplyr::filter(prov=="AB") %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-prov) %>% 
+  dplyr::mutate(dplyr::across(where(is.numeric),scales::dollar)) %>% 
+  kableExtra::kbl(align = "rlrrr", digits = 2, caption = "Alberta Markets (seasonality adjustment)" ) %>% 
+  kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
+```
+***(5) TWEAK NET MARGIN***
+
+```{r net_margin_tweaks_column}
+load("./Data/weighted_nm.rda")
+
+result_05 <- 
+  result_04 %>% 
+  # join the nm changes, drop the location column
+  dplyr::left_join( weighted_nm %>% dplyr::select(-location) %>% dplyr::filter(year==2020), by="site") %>% 
+  # compress the NM tweaks
+  tidyr::nest(nm_tweaks=c(midgrade, premium)) 
+
+# show the two new columns
+result_05 %>% 
+  dplyr::glimpse()
+
+```
+Like we did with the seasonality, we write a function to insert the net margin tweak.
+```{r map_nm_tweak}
+map_nm_tweak <- 
+  function(tbl, tweaks){
+    tmp_names <- names(tbl)
+    # define function for the seasonality tweaks
+    update_cols <-
+      function(vals, s_tweak){
+        .a <- vals[1]
+        .b <- s_tweak
+        .c <- .b - .a
+        .d <- exp( log(.b)-log(.a) ) - 1
+        return(c(.a, .b, .c, .d))
+      }
+    MID_vals <- tbl %>% dplyr::pull(NM.cpl_MID)
+    PUL_vals <- tbl %>% dplyr::pull(NM.cpl_PUL)
+    
+    tbl %>% 
+      dplyr::select(-c(NM.cpl_MID,NM.cpl_PUL)) %>% 
+      tibble::add_column(
+        NM.cpl_PUL = update_cols(PUL_vals, tweaks %>% dplyr::pull(premium))
+        , NM.cpl_MID = update_cols(MID_vals, tweaks %>% dplyr::pull(midgrade))
+      ) %>% 
+      dplyr::select(tidyselect::all_of(tmp_names)) %>% 
+    return()
+}
+```
+
+
+with the results of the tweaks stored in the column *nm_results* and a corresponding summary column named *nm_summary*.
+```{r}
+result_06 <- 
+  result_05 %>% 
+  dplyr::mutate(
+    nm_results =
+      purrr::map2(
+        base_results
+        , nm_tweaks
+        , ~map_nm_tweak(.x, .y)
+      )
+     , nm_summary = purrr::map(nm_results, net.margin.summary )
+  )
+
+```
+
+```{r}
+# generate the table for the base case
+nm_results_tbl <- 
+  result_06 %>% 
+  dplyr::select(mkt_data,nm_summary) %>% 
+  get_NMD_by_market_table(days=as.numeric(date_data$last_interval))
+
+# filter out the results for Alberta and present them
+nm_results_tbl %>% 
+  dplyr::filter(prov=="AB") %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-prov) %>% 
+  dplyr::mutate(dplyr::across(where(is.numeric),scales::dollar)) %>% 
+  kableExtra::kbl(align = "rlrrr", digits = 2, caption = "Alberta Markets (nm adjustment)" ) %>% 
+  kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
+```
+Finally, compute seasonality seasonality 
+```{r}
+result_07 <- 
+  result_06 %>% 
+  dplyr::mutate(
+    seasonality_nm_results =
+      purrr::map2(
+        seasonality_results
+        , nm_tweaks
+        , ~map_nm_tweak(.x, .y)
+      )
+     , seasonality_nm_summary = purrr::map(seasonality_nm_results, net.margin.summary )
+  )
+
+```
+
+```{r}
+# generate the table for the base case
+seasonality_nm_results_tbl <- 
+  result_07 %>% 
+  dplyr::select(mkt_data,seasonality_nm_summary) %>% 
+  get_NMD_by_market_table(days=as.numeric(date_data$last_interval))
+
+# filter out the results for Alberta and present them
+seasonality_nm_results_tbl %>% 
+  dplyr::filter(prov=="AB") %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-prov) %>% 
+  dplyr::mutate(dplyr::across(where(is.numeric),scales::dollar)) %>% 
+  kableExtra::kbl(align = "rlrrr", digits = 2, caption = "Alberta Markets (seasonality & nm adjustment)" ) %>% 
+  kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
+```
+We have a similar table to volumes
+```{r}
+# generate the table for the base case
+base_vol_results_tbl <- 
+  result_04 %>% 
+  dplyr::select(mkt_data,base_summary) %>% 
+  get_VOL_by_market_table()
+
+# filter out the results for Alberta and present them
+base_vol_results_tbl %>% 
+  dplyr::filter(prov=="AB") %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-prov) %>% 
+  dplyr::mutate(dplyr::across(
+    `volume pre- total MID`:`volume post- total PUL`
+    , ~format(., big.mark=",", nsmall=0))
+    ) %>% 
+  kableExtra::kbl(align = "rlrrrrrr", digits = 2, caption = "Alberta Markets (baseline)" ) %>% 
+  kableExtra::row_spec(4, bold = T, color = "white", background = "darkgreen") %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped"), font_size = 12, full_width = F)
+```
+So here's where we are so far (and we're not yet done).
+```{r}
+result_07 %>% dplyr::glimpse()
+```
+Finishing up we are going to add two more net margin tweaks similar to the first, one each for the same periods 2019 and 2018.
+```{r 2019_net_margin_tweaks}
+result_08 <- 
+  result_07 %>% 
+  # join the nm changes, drop the location column
+  dplyr::left_join( 
+    weighted_nm %>% 
+      dplyr::filter(year==2019) %>% 
+      dplyr::select(-c(location, year))
+    , by="site") %>% 
+  # compress the NM tweaks
+  tidyr::nest(`2019_nm_tweaks`=c(midgrade, premium)) 
+
+result_08 <- 
+  result_08 %>% 
+  dplyr::mutate(
+    `2019_nm_results` =
+      purrr::map2(
+        base_results
+        , `2019_nm_tweaks`
+        , ~map_nm_tweak(.x, .y)
+      )
+     , `2019_nm_summary` = purrr::map(`2019_nm_results`, net.margin.summary )
+  )
+```
+repeat for 2018
+```{r 2018_net_margin_tweaks}
+result_08 <- 
+  result_08 %>% 
+  # join the nm changes, drop the location column
+  dplyr::left_join( 
+    weighted_nm %>% 
+      dplyr::filter(year==2018) %>% 
+      dplyr::select(-c(location, year))
+    , by="site") %>% 
+  # compress the NM tweaks
+  tidyr::nest(`2018_nm_tweaks`=c(midgrade, premium)) 
+
+result_08 <- 
+  result_08 %>% 
+  dplyr::mutate(
+    `2018_nm_results` =
+      purrr::map2(
+        base_results
+        , `2018_nm_tweaks`
+        , ~map_nm_tweak(.x, .y)
+      )
+     , `2018_nm_summary` = purrr::map(`2018_nm_results`, net.margin.summary )
+  )
+```
+and finally, checking
+```{r added_2018_2019}
+result_08 %>% 
+  dplyr::glimpse()
+```
+We finish off by building the combined margin and seasonality tables
+```{r 2018_2019_nm_seasonality_tables}
+result_08 <- 
+  result_08 %>% 
+  dplyr::mutate(
+    `2019_seasonality_nm_results` =
+      purrr::map2(
+        seasonality_results
+        , `2019_nm_tweaks`
+        , ~map_nm_tweak(.x, .y)
+      )
+     , `2019_seasonality_nm_summary` = purrr::map(`2019_seasonality_nm_results`, net.margin.summary )
+  )
+
+result_08 <- 
+  result_08 %>% 
+  dplyr::mutate(
+    `2018_seasonality_nm_results` =
+      purrr::map2(
+        seasonality_results
+        , `2018_nm_tweaks`
+        , ~map_nm_tweak(.x, .y)
+      )
+     , `2018_seasonality_nm_summary` = purrr::map(`2018_seasonality_nm_results`, net.margin.summary )
+  )
+```
+Check and save
+```{r}
+result_08 %>% 
+  dplyr::glimpse()
+
+# file.name <- tempfile(pattern = "qwikwinz_results_", tmpdir = data.dir, fileext = ".rds")
+# saveRDS(result_08, file.name)
+```
+
+
